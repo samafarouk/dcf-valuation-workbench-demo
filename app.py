@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import date
 
 import pandas as pd
@@ -8,18 +9,6 @@ st.set_page_config(page_title="DCF Valuation Workbench", page_icon="📊", layou
 
 NAVY = "#10233f"
 BLUE = "#2476c7"
-
-
-def display_excel_preview(frame: pd.DataFrame, *, height=None):
-    """Render imported Excel tables robustly when columns mix strings, numbers and blanks."""
-    safe = frame.copy()
-    for col in safe.columns:
-        if safe[col].dtype == "object":
-            # Excel workbooks often mix numbers, text labels, and blank cells in the same column.
-            # Convert these mixed columns to consistent text for display only; source values stay intact.
-            safe[col] = safe[col].map(lambda value: "" if pd.isna(value) else str(value))
-    st.dataframe(safe, width="stretch", hide_index=True, height=height)
-
 
 st.markdown(
     f"""
@@ -77,6 +66,36 @@ def calculate_dcf(current_fcff, growth_rate, wacc, terminal_growth, forecast_yea
         "Terminal Value": terminal_value,
         "PV of Terminal Value": pv_terminal,
         "FCFF Forecast": fcff_forecast,
+        "Years": years,
+    }
+
+
+def calculate_existing_forecast_dcf(fcff_values, wacc, terminal_growth, net_debt, shares_outstanding):
+    """Value a forecast already supplied by the user, without growing it a second time."""
+    values = [float(v) for v in fcff_values]
+    if not values:
+        raise ValueError("Import and confirm at least one forecast FCFF value first.")
+    if wacc <= 0 or wacc <= terminal_growth:
+        raise ValueError("WACC must be positive and greater than terminal growth.")
+    if terminal_growth < 0:
+        raise ValueError("Terminal growth cannot be negative.")
+    if shares_outstanding <= 0:
+        raise ValueError("Shares outstanding must be positive.")
+    years = list(range(1, len(values) + 1))
+    discounted = [cf / ((1 + wacc) ** year) for year, cf in zip(years, values)]
+    pv_cash_flows = sum(discounted)
+    terminal_value = values[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv_terminal = terminal_value / ((1 + wacc) ** len(values))
+    enterprise_value = pv_cash_flows + pv_terminal
+    equity_value = enterprise_value - net_debt
+    return {
+        "Enterprise Value": enterprise_value,
+        "Equity Value": equity_value,
+        "Value per Share": equity_value / shares_outstanding,
+        "PV of Forecast Cash Flows": pv_cash_flows,
+        "Terminal Value": terminal_value,
+        "PV of Terminal Value": pv_terminal,
+        "FCFF Forecast": values,
         "Years": years,
     }
 
@@ -182,16 +201,27 @@ def make_excel_report(company, summary, forecast, scenarios, sensitivity, histor
 with st.sidebar:
     st.header("Valuation inputs")
     company = st.text_input("Company name", "Example Company")
+    st.markdown("#### Valuation method")
+    valuation_method = st.radio(
+        "How do you want to value the company?",
+        ["Build a new forecast", "Value my existing forecast"],
+        key="valuation_method",
+        help="Choose Build a new forecast to grow one starting FCFF value. Choose Value my existing forecast to discount the forecast cash flows imported from your workbook."
+    )
     st.markdown("#### Cash flow assumptions")
-    manual_fcff = st.number_input("Starting FCFF (EGP M)", min_value=0.01, value=100.0, step=5.0)
-    growth_pct = st.number_input("Annual FCFF growth (%)", min_value=-99.0, max_value=100.0, value=8.0, step=1.0)
+    if "starting_fcff_input" not in st.session_state:
+        st.session_state["starting_fcff_input"] = 100.0
+    manual_fcff = st.number_input("Starting FCFF (EGP M)", min_value=0.01, value=float(st.session_state["starting_fcff_input"]), step=5.0, key="starting_fcff_input", disabled=(valuation_method == "Value my existing forecast"))
+    if valuation_method == "Value my existing forecast":
+        st.caption("Starting FCFF is not used in this mode. The imported forecast values will be discounted directly.")
+    growth_pct = st.number_input("Annual FCFF growth (%)", min_value=-99.0, max_value=100.0, value=8.0, step=1.0, disabled=(valuation_method == "Value my existing forecast"))
     wacc_pct = st.number_input("WACC (%)", min_value=0.1, max_value=100.0, value=12.0, step=0.5)
     terminal_pct = st.number_input("Terminal growth (%)", min_value=0.0, max_value=50.0, value=3.0, step=0.5)
     years = st.number_input("Forecast years", min_value=1, max_value=20, value=5, step=1)
     st.markdown("#### Capital structure")
     net_debt = st.number_input("Net debt (EGP M)", value=250.0, step=25.0)
     shares = st.number_input("Shares outstanding (millions)", min_value=0.01, value=100.0, step=10.0)
-    calculate = st.button("Calculate valuation", type="primary", width="stretch")
+    calculate = st.button("Calculate valuation", type="primary", use_container_width=True)
 
 st.subheader("1. Choose your FCFF source")
 source = st.radio("How do you want to provide starting FCFF?", ["Enter FCFF manually", "Calculate FCFF from financial statements"], horizontal=True)
@@ -228,7 +258,7 @@ if source == "Calculate FCFF from financial statements":
             else:
                 st.markdown("#### Step A — Preview the worksheet")
                 st.caption("This is the raw worksheet, before interpretation. If the sheet contains side-by-side blocks, select only one block at a time using the row and column boundaries below.")
-                display_excel_preview(raw_grid.head(30), height=420)
+                st.dataframe(raw_grid.head(30), use_container_width=True, hide_index=True)
                 st.markdown("#### Step B — Select the table you want to use")
                 import_mode = st.radio(
                     "What kind of data are you importing?",
@@ -255,7 +285,7 @@ if source == "Calculate FCFF from financial statements":
                     table = raw_grid.iloc[int(row_start)-1:int(row_end), int(col_start)-1:int(col_end)].copy()
                     table = table.dropna(axis=0, how="all").dropna(axis=1, how="all")
                     st.markdown("##### Selected table preview")
-                    display_excel_preview(table, height=420)
+                    st.dataframe(table, use_container_width=True, hide_index=True)
 
                     if import_mode == "Historical statements (calculate FCFF)":
                         orientation = st.radio("How is this table arranged?", ["Each row is a year (standard)", "Metrics are rows and years are columns (horizontal)"], horizontal=False, key="selected_table_orientation")
@@ -325,7 +355,7 @@ if source == "Calculate FCFF from financial statements":
                             else:
                                 candidate = pd.DataFrame({target: data[source_col] for target, source_col in mapped.items()})
                                 st.markdown("#### Step D — Review and edit the mapped inputs")
-                                edited = st.data_editor(candidate, width="stretch", hide_index=True, num_rows="fixed", key="mapped_financial_review")
+                                edited = st.data_editor(candidate, use_container_width=True, hide_index=True, num_rows="fixed", key="mapped_financial_review")
                                 if st.button("Confirm data and calculate historical FCFF", type="primary", key="confirm_financial_data"):
                                     try:
                                         clean = validate_mapped_data(edited)
@@ -340,6 +370,7 @@ if source == "Calculate FCFF from financial statements":
                                             st.session_state["confirmed_financial_history"] = history
                                             st.session_state["confirmed_starting_fcff"] = starting_fcff
                                             st.session_state["confirmed_source_label"] = source_label
+                                            st.session_state["starting_fcff_input"] = starting_fcff
                                             st.success(f"Data confirmed. Latest calculated FCFF: {starting_fcff:,.2f} (FY {int(latest['Year'])}).")
                                     except Exception as e:
                                         st.error(f"Please review the mapped data: {e}")
@@ -354,26 +385,55 @@ if source == "Calculate FCFF from financial statements":
                             selected_metric = st.selectbox("Choose the row that represents FCFF / FCF", metric_options, key="existing_fcf_metric")
                             matching_positions = [i for i, value in enumerate(metric_names) if value == selected_metric]
                             metric_row = table.iloc[matching_positions[0]]
-                            value_columns = [i for i in table.columns if i != label_col]
+                            label_pos = int(label_col)
                             year_values = []
                             fcff_values = []
-                            for col in value_columns:
-                                val = pd.to_numeric(pd.Series([metric_row[col]]), errors="coerce").iloc[0]
-                                if pd.notna(val):
-                                    year_values.append(str(table.iloc[0, col]).strip())
-                                    fcff_values.append(float(val))
+                            period_row_positions = [
+                                i for i, value in enumerate(table.iloc[:, label_pos].fillna("").astype(str).str.strip().str.lower().tolist())
+                                if value == "period"
+                            ]
+                            has_period_row = bool(period_row_positions)
+                            for pos in range(table.shape[1]):
+                                if pos == label_pos:
+                                    continue
+                                val = pd.to_numeric(pd.Series([metric_row.iloc[pos]]), errors="coerce").iloc[0]
+                                if pd.isna(val):
+                                    continue
+                                header = table.iloc[0, pos] if table.shape[0] else None
+                                period = "" if pd.isna(header) else str(header).strip()
+                                if not period or period.lower() in {"nan", "none", "nat"}:
+                                    if has_period_row:
+                                        period_value = table.iloc[period_row_positions[0], pos]
+                                        period = "" if pd.isna(period_value) else str(period_value).strip()
+                                if not period or period.lower() in {"nan", "none", "nat"}:
+                                    continue
+                                # Accept year labels such as 2026/2026F or numeric forecast periods 1,2,3...
+                                if not (re.search(r"(19|20)\\d{2}", period) or re.fullmatch(r"\\d+(?:\\.0)?", period) or re.fullmatch(r"year\\s*\\d+", period.lower())):
+                                    continue
+                                year_values.append(period)
+                                fcff_values.append(float(val))
                             if fcff_values:
                                 preview_fcff = pd.DataFrame({"Period": year_values, "FCFF / FCF value": fcff_values})
-                                display_excel_preview(preview_fcff, height=240)
+                                st.dataframe(preview_fcff, use_container_width=True, hide_index=True)
                                 st.warning("Confirm that this row is unlevered free cash flow to the firm (FCFF), not equity free cash flow (FCFE), EBITDA, or a valuation output. The app cannot infer financial meaning from the label alone.")
-                                if st.button("Use the last numeric value as starting FCFF", type="primary", key="confirm_existing_fcf"):
-                                    starting_fcff = fcff_values[-1]
-                                    source_label = f"Existing model row — {selected_metric} ({year_values[-1]})"
+                                confirm_label = "Confirm imported forecast" if len(fcff_values) > 1 else "Confirm cash flow value"
+                                if st.button(confirm_label, type="primary", key="confirm_existing_fcf"):
+                                    source_label = f"Existing model row — {selected_metric}"
                                     history = None
-                                    st.session_state["confirmed_starting_fcff"] = starting_fcff
+                                    st.session_state["confirmed_starting_fcff"] = float(fcff_values[-1])
                                     st.session_state["confirmed_source_label"] = source_label
                                     st.session_state["confirmed_financial_history"] = None
-                                    st.success(f"Starting FCFF set to {starting_fcff:,.2f} from {selected_metric} ({year_values[-1]}).")
+                                    st.session_state["confirmed_existing_forecast"] = {
+                                        "periods": [str(x) for x in year_values],
+                                        "values": [float(x) for x in fcff_values],
+                                        "metric": str(selected_metric),
+                                    }
+                                    # Only populate the starting-FCFF field for the new-forecast workflow.
+                                    # Do not mistake the final forecast year for the starting cash flow.
+                                    if valuation_method == "Build a new forecast":
+                                        st.session_state["starting_fcff_input"] = float(fcff_values[0])
+                                    st.success(f"Imported {len(fcff_values)} forecast cash-flow value(s) from {selected_metric}.")
+                                    st.info("Choose **Value my existing forecast** in the sidebar to discount all imported periods, or **Build a new forecast** to use a single starting FCFF.")
                             else:
                                 st.info("No numeric values were found in this row within the selected table. Expand or adjust your selected range.")
                         else:
@@ -382,12 +442,14 @@ if source == "Calculate FCFF from financial statements":
                 saved_history = st.session_state.get("confirmed_financial_history")
                 saved_fcff = st.session_state.get("confirmed_starting_fcff")
                 if saved_fcff is not None and st.session_state.get("confirmed_source_label"):
-                    starting_fcff = float(saved_fcff)
                     source_label = st.session_state["confirmed_source_label"]
+                    starting_fcff = float(saved_fcff)
+                    if valuation_method == "Build a new forecast":
+                        st.session_state["starting_fcff_input"] = float(saved_fcff)
                     if saved_history is not None:
                         history = saved_history
                         st.success(f"Using confirmed historical data. Latest FCFF: {starting_fcff:,.2f} — {source_label}.")
-                        st.dataframe(history.round(2), width="stretch", hide_index=True)
+                        st.dataframe(history.round(2), use_container_width=True, hide_index=True)
                     elif str(source_label).startswith("Existing model row"):
                         st.success(f"Using confirmed existing FCFF value: {starting_fcff:,.2f} — {source_label}.")
         except Exception as e:
@@ -405,20 +467,42 @@ if calculate:
     else:
         try:
             g, r, tg = growth_pct / 100, wacc_pct / 100, terminal_pct / 100
-            base = calculate_dcf(starting_fcff, g, r, tg, int(years), net_debt, shares)
+            imported_forecast = st.session_state.get("confirmed_existing_forecast")
+            if valuation_method == "Value my existing forecast":
+                if not imported_forecast or not imported_forecast.get("values"):
+                    raise ValueError("Choose the Existing DCF model import option, select the FCFF row, and click Confirm imported forecast first.")
+                forecast_values = imported_forecast["values"]
+                base = calculate_existing_forecast_dcf(forecast_values, r, tg, net_debt, shares)
+                valuation_source = f"Existing forecast — {imported_forecast.get('metric', 'FCFF row')}"
+                model_growth = None
+                model_years = len(forecast_values)
+            else:
+                # Use the explicitly selected starting FCFF; never substitute the last forecast year automatically.
+                starting_fcff = float(st.session_state.get("starting_fcff_input", manual_fcff))
+                base = calculate_dcf(starting_fcff, g, r, tg, int(years), net_debt, shares)
+                valuation_source = source_label if source_label else "Manual starting FCFF"
+                model_growth = g
+                model_years = int(years)
+
             scenario_inputs = {
-                "Downside": (g - 0.02, r + 0.02, max(0, tg - 0.01)),
-                "Base": (g, r, tg),
+                "Downside": (r + 0.02, max(0, tg - 0.01)),
+                "Base": (r, tg),
             }
             up_r = max(r - 0.02, tg + 0.02)
             up_tg = min(tg + 0.01, up_r - 0.01)
-            scenario_inputs["Upside"] = (g + 0.02, up_r, max(0, up_tg))
+            scenario_inputs["Upside"] = (up_r, max(0, up_tg))
             scenario_rows = []
-            for name, (sg, sr, stg) in scenario_inputs.items():
+            for name, (sr, stg) in scenario_inputs.items():
                 if sr <= stg:
                     sr = stg + 0.01
-                out = calculate_dcf(starting_fcff, sg, sr, stg, int(years), net_debt, shares)
-                scenario_rows.append({"Scenario": name, "FCFF Growth": sg, "WACC": sr, "Terminal Growth": stg,
+                if valuation_method == "Value my existing forecast":
+                    out = calculate_existing_forecast_dcf(forecast_values, sr, stg, net_debt, shares)
+                    scenario_growth = None
+                else:
+                    sg = g + ({"Downside": -0.02, "Base": 0, "Upside": 0.02}[name])
+                    out = calculate_dcf(starting_fcff, sg, sr, stg, int(years), net_debt, shares)
+                    scenario_growth = sg
+                scenario_rows.append({"Scenario": name, "FCFF Growth": scenario_growth, "WACC": sr, "Terminal Growth": stg,
                                       "Enterprise Value (EGP M)": out["Enterprise Value"], "Equity Value (EGP M)": out["Equity Value"],
                                       "Value per Share (EGP)": out["Value per Share"]})
             scenarios = pd.DataFrame(scenario_rows)
@@ -430,13 +514,22 @@ if calculate:
                     if sr <= stg:
                         sensitivity.loc[f"{sr:.1%}", f"{stg:.1%}"] = float("nan")
                     else:
-                        out = calculate_dcf(starting_fcff, g, sr, stg, int(years), net_debt, shares)
+                        if valuation_method == "Value my existing forecast":
+                            out = calculate_existing_forecast_dcf(forecast_values, sr, stg, net_debt, shares)
+                        else:
+                            out = calculate_dcf(starting_fcff, g, sr, stg, int(years), net_debt, shares)
                         sensitivity.loc[f"{sr:.1%}", f"{stg:.1%}"] = out["Enterprise Value"]
-            forecast = pd.DataFrame({"Year": [f"Year {y}" for y in base["Years"]], "Projected FCFF (EGP M)": base["FCFF Forecast"]})
+            if valuation_method == "Value my existing forecast":
+                forecast_labels = imported_forecast.get("periods", [])
+                if len(forecast_labels) != len(base["FCFF Forecast"]):
+                    forecast_labels = [f"Year {y}" for y in base["Years"]]
+                forecast = pd.DataFrame({"Period": forecast_labels, "Projected FCFF (EGP M)": base["FCFF Forecast"]})
+            else:
+                forecast = pd.DataFrame({"Year": [f"Year {y}" for y in base["Years"]], "Projected FCFF (EGP M)": base["FCFF Forecast"]})
             summary = pd.DataFrame([{
-                "Company": company, "Valuation Date": str(date.today()), "FCFF Source": source_label,
-                "Starting FCFF (EGP M)": starting_fcff, "FCFF Growth": g, "WACC": r,
-                "Terminal Growth": tg, "Forecast Years": int(years), "Net Debt (EGP M)": net_debt,
+                "Company": company, "Valuation Date": str(date.today()), "FCFF Source": valuation_source,
+                "Starting FCFF (EGP M)": (forecast_values[0] if valuation_method == "Value my existing forecast" else starting_fcff), "FCFF Growth": (g if valuation_method == "Build a new forecast" else "Not applied"),
+                "WACC": r, "Terminal Growth": tg, "Forecast Years": len(base["FCFF Forecast"]), "Valuation Method": valuation_method, "Net Debt (EGP M)": net_debt,
                 "Shares Outstanding (M)": shares, "PV of Forecast Cash Flows (EGP M)": base["PV of Forecast Cash Flows"],
                 "Terminal Value (EGP M)": base["Terminal Value"], "PV of Terminal Value (EGP M)": base["PV of Terminal Value"],
                 "Enterprise Value (EGP M)": base["Enterprise Value"], "Equity Value (EGP M)": base["Equity Value"],
@@ -458,21 +551,21 @@ if package:
 
     st.markdown("#### Forecast free cash flow")
     st.bar_chart(package["forecast"].set_index("Year"), y="Projected FCFF (EGP M)")
-    st.dataframe(package["forecast"].round(2), width="stretch", hide_index=True)
+    st.dataframe(package["forecast"].round(2), use_container_width=True, hide_index=True)
 
     st.markdown("#### Downside / base / upside scenarios")
     st.dataframe(package["scenarios"].style.format({"FCFF Growth":"{:.1%}", "WACC":"{:.1%}", "Terminal Growth":"{:.1%}",
-        "Enterprise Value (EGP M)":"{:,.2f}", "Equity Value (EGP M)":"{:,.2f}", "Value per Share (EGP)":"{:,.2f}"}), width="stretch", hide_index=True)
+        "Enterprise Value (EGP M)":"{:,.2f}", "Equity Value (EGP M)":"{:,.2f}", "Value per Share (EGP)":"{:,.2f}"}), use_container_width=True, hide_index=True)
 
     st.markdown("#### Enterprise value sensitivity")
     st.caption("Rows are WACC; columns are terminal growth. N/A means WACC is not greater than terminal growth.")
-    st.dataframe(package["sensitivity"].style.format("{:,.2f}", na_rep="N/A").background_gradient(cmap="RdYlGn", axis=None), width="stretch")
+    st.dataframe(package["sensitivity"].style.format("{:,.2f}", na_rep="N/A").background_gradient(cmap="RdYlGn", axis=None), use_container_width=True)
 
     with st.expander("Detailed valuation components"):
         base = package["base"]
         details = pd.DataFrame({"Component": ["PV of forecast cash flows", "Terminal value (at end of forecast)", "PV of terminal value"],
             "EGP millions": [base["PV of Forecast Cash Flows"], base["Terminal Value"], base["PV of Terminal Value"]]})
-        st.dataframe(details.style.format({"EGP millions":"{:,.2f}"}), width="stretch", hide_index=True)
+        st.dataframe(details.style.format({"EGP millions":"{:,.2f}"}), use_container_width=True, hide_index=True)
 
     st.markdown("#### Export your report")
     xlsx_bytes = make_excel_report(package["company"], package["summary"], package["forecast"], package["scenarios"], package["sensitivity"], package["history"])
