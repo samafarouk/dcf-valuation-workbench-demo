@@ -343,30 +343,40 @@ if source == "Calculate FCFF from financial statements":
                             selected_metric = st.selectbox("Choose the row that represents FCFF / FCF", metric_options, key="existing_fcf_metric")
                             matching_positions = [i for i, value in enumerate(metric_names) if value == selected_metric]
                             metric_row = table.iloc[matching_positions[0]]
-                            value_columns = [i for i in table.columns if i != label_col]
+                            # Work by column POSITION rather than label. Excel-derived tables can
+                            # have duplicate/mixed column labels, which makes label-based indexing fragile.
+                            label_pos = list(table.columns).index(label_col)
                             year_values = []
                             fcff_values = []
-                            # Complex worksheets may contain extra numeric cells after the forecast
-                            # years. Only accept values under a meaningful year/period heading.
-                            def clean_period(value):
-                                if pd.isna(value):
-                                    return None
-                                text = str(value).strip()
-                                if not text or text.lower() in {"nan", "none", "nat"}:
-                                    return None
-                                if re.search(r"(19|20)\\d{2}", text):
-                                    return text
-                                if re.fullmatch(r"year\\s*\\d+", text.lower()):
-                                    return text
-                                return None
+                            for pos in range(table.shape[1]):
+                                if pos == label_pos:
+                                    continue
+                                raw_value = metric_row.iloc[pos]
+                                val = pd.to_numeric(pd.Series([raw_value]), errors="coerce").iloc[0]
+                                if pd.isna(val):
+                                    continue
 
-                            period_header_row = table.iloc[0]
-                            for col in value_columns:
-                                period = clean_period(period_header_row[col])
-                                val = pd.to_numeric(pd.Series([metric_row[col]]), errors="coerce").iloc[0]
-                                if period is not None and pd.notna(val):
-                                    year_values.append(period)
-                                    fcff_values.append(float(val))
+                                # In an existing DCF table, periods may be named 1..5 instead of years.
+                                # Prefer a valid year/period heading; if absent, use the period index
+                                # only when the selected table visibly contains a Period row.
+                                header_value = table.iloc[0, pos] if table.shape[0] else None
+                                period_text = "" if pd.isna(header_value) else str(header_value).strip()
+                                if not period_text or period_text.lower() in {"nan", "none", "nat"}:
+                                    period_text = ""
+
+                                has_period_row = table.iloc[:, label_pos].astype(str).str.strip().str.lower().eq("period").any()
+                                if not period_text:
+                                    if has_period_row:
+                                        period_text = f"Column {pos + 1}"
+                                    else:
+                                        continue
+
+                                # Ignore non-period numeric columns such as ratios or stray formula values.
+                                if not re.search(r"(19|20)\\d{2}|^\\d+(?:\\.0)?$|year\\s*\\d+", period_text.lower()):
+                                    continue
+
+                                year_values.append(period_text)
+                                fcff_values.append(float(val))
                             if fcff_values:
                                 preview_fcff = pd.DataFrame({"Period": year_values, "FCFF / FCF value": fcff_values})
                                 st.dataframe(preview_fcff, use_container_width=True, hide_index=True)
@@ -379,7 +389,7 @@ if source == "Calculate FCFF from financial statements":
                                     st.session_state["confirmed_source_label"] = source_label
                                     st.session_state["confirmed_financial_history"] = None
                                     st.success(f"Starting FCFF set to {starting_fcff:,.2f} from {selected_metric} ({year_values[-1]}).")
-                                    st.info("Next: click **Calculate valuation** in the left sidebar to generate the valuation dashboard, scenarios, sensitivity analysis, and exports.")
+                                    st.info("Next, click Calculate valuation in the left sidebar. This imports one starting cash flow; it does not import the full forecast directly.")
                             else:
                                 st.info("No numeric values were found in this row within the selected table. Expand or adjust your selected range.")
                         else:
