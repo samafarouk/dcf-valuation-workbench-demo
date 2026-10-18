@@ -399,16 +399,26 @@ if source == "Calculate FCFF from financial statements":
                                 val = pd.to_numeric(pd.Series([metric_row.iloc[pos]]), errors="coerce").iloc[0]
                                 if pd.isna(val):
                                     continue
-                                header = table.iloc[0, pos] if table.shape[0] else None
-                                period = "" if pd.isna(header) else str(header).strip()
+
+                                # IMPORTANT: many DCF sheets put assumptions (e.g. WACC) in row 1
+                                # and put the actual forecast period numbers in a later row named "Period".
+                                # Prefer that Period row; never mistake a WACC decimal such as 0.2444
+                                # for a period label.
+                                period = ""
+                                if has_period_row:
+                                    period_value = table.iloc[period_row_positions[0], pos]
+                                    period = "" if pd.isna(period_value) else str(period_value).strip()
+
+                                # If there is no usable Period-row label, use a year/period column heading.
                                 if not period or period.lower() in {"nan", "none", "nat"}:
-                                    if has_period_row:
-                                        period_value = table.iloc[period_row_positions[0], pos]
-                                        period = "" if pd.isna(period_value) else str(period_value).strip()
+                                    header = table.iloc[0, pos] if table.shape[0] else None
+                                    candidate = "" if pd.isna(header) else str(header).strip()
+                                    if re.search(r"(19|20)\d{2}", candidate) or re.fullmatch(r"\\d+(?:\\.0)?", candidate) or re.fullmatch(r"year\\s*\\d+", candidate.lower()):
+                                        period = candidate
+
                                 if not period or period.lower() in {"nan", "none", "nat"}:
                                     continue
-                                # Accept year labels such as 2026/2026F or numeric forecast periods 1,2,3...
-                                if not (re.search(r"(19|20)\\d{2}", period) or re.fullmatch(r"\\d+(?:\\.0)?", period) or re.fullmatch(r"year\\s*\\d+", period.lower())):
+                                if not (re.search(r"(19|20)\d{2}", period) or re.fullmatch(r"\\d+(?:\\.0)?", period) or re.fullmatch(r"year\\s*\\d+", period.lower())):
                                     continue
                                 year_values.append(period)
                                 fcff_values.append(float(val))
