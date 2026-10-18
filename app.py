@@ -69,31 +69,65 @@ def calculate_dcf(current_fcff, growth_rate, wacc, terminal_growth, forecast_yea
     }
 
 
-def read_financial_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        data = pd.read_csv(uploaded_file)
-    else:
-        data = pd.read_excel(uploaded_file)
-    data.columns = [str(c).strip() for c in data.columns]
+COLUMN_ALIASES = {
+    "Year": ["year", "fy", "fiscal year", "period", "financial year", "date"],
+    "EBIT": ["ebit", "operating profit", "operating income", "profit from operations", "operating earnings"],
+    "Tax_Rate": ["tax_rate", "tax rate", "effective tax rate", "tax %", "tax rate %", "tax rate (%)"],
+    "D&A": ["d&a", "da", "depreciation and amortization", "depreciation & amortization", "depreciation and amortisation", "depreciation & amortisation", "depreciation amortization", "depreciation", "depreciation and amortization expense"],
+    "CapEx": ["capex", "capital expenditure", "capital expenditures", "purchase of property plant and equipment", "purchases of property plant and equipment", "additions to property plant and equipment", "capital spending"],
+    "Receivables": ["receivables", "accounts receivable", "trade receivables", "trade and other receivables", "account receivables"],
+    "Inventory": ["inventory", "inventories", "stocks"],
+    "Payables": ["payables", "accounts payable", "trade payables", "trade and other payables", "account payables"],
+}
+
+
+def normalize_label(value):
+    return " ".join(str(value).strip().lower().replace("_", " ").replace("&", " and ").replace("%", " percent").split())
+
+
+def suggest_column_mapping(columns):
+    normalized = {col: normalize_label(col) for col in columns}
+    mapping = {}
+    for target, aliases in COLUMN_ALIASES.items():
+        choices = [normalize_label(target)] + [normalize_label(x) for x in aliases]
+        match = next((col for col, norm in normalized.items() if norm in choices), None)
+        if match is None:
+            # Conservative partial matching for common labels; user confirms every selection.
+            match = next((col for col, norm in normalized.items() if any(a in norm for a in choices if len(a) > 4)), None)
+        mapping[target] = match if match is not None else "— Select a column —"
+    return mapping
+
+
+def read_uploaded_table(uploaded_file, sheet_name=None):
+    uploaded_file.seek(0)
+    if uploaded_file.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+
+
+def validate_mapped_data(data):
     missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
     if missing:
-        raise ValueError("The file is missing these required columns: " + ", ".join(missing))
+        raise ValueError("Please map every required field before continuing: " + ", ".join(missing))
     data = data[REQUIRED_COLUMNS].copy()
     for col in REQUIRED_COLUMNS:
-        data[col] = pd.to_numeric(data[col], errors="raise")
+        data[col] = pd.to_numeric(data[col], errors="coerce")
     if data.empty:
-        raise ValueError("The uploaded file has no rows.")
+        raise ValueError("The selected sheet has no data rows.")
+    blank_cols = [c for c in REQUIRED_COLUMNS if data[c].isna().all()]
+    if blank_cols:
+        raise ValueError("No numeric values were found for: " + ", ".join(blank_cols) + ". Check your column mapping and selected sheet.")
     if data[REQUIRED_COLUMNS].isna().any().any():
-        raise ValueError("Some required cells are blank. Fill them in before uploading.")
+        bad = [c for c in REQUIRED_COLUMNS if data[c].isna().any()]
+        raise ValueError("Some cells are blank or non-numeric in: " + ", ".join(bad) + ". Fill or correct these values in the review table.")
     if data["Year"].duplicated().any():
-        raise ValueError("Each year should appear only once.")
+        raise ValueError("Each year should appear only once. Check for duplicate periods.")
     if not data["Year"].mod(1).eq(0).all():
         raise ValueError("Year values should be whole numbers, such as 2024.")
     if ((data["Tax_Rate"] < 0) | (data["Tax_Rate"] > 100)).any():
-        raise ValueError("Tax_Rate must be entered as a number from 0 to 100 (for example, 22 for 22%).")
+        raise ValueError("Tax rate must be entered as a percentage from 0 to 100 (for example, 22 for 22%, not 0.22).")
     if len(data) < 2:
-        raise ValueError("Upload at least two years of financial data to calculate the change in working capital.")
+        raise ValueError("Upload at least two years of data so the model can calculate the change in working capital.")
     return data.sort_values("Year").reset_index(drop=True)
 
 
@@ -154,27 +188,81 @@ starting_fcff = manual_fcff
 source_label = "Manual input"
 
 if source == "Calculate FCFF from financial statements":
-    st.markdown("Upload a CSV or Excel file containing the historical financial data listed below.")
-    with st.expander("What columns does my file need?", expanded=True):
-        st.code("Year, EBIT, Tax_Rate, D&A, CapEx, Receivables, Inventory, Payables", language="text")
-        st.caption("Use one row per year. Enter Tax_Rate as 22 for 22%, not 0.22. Use at least two years so the model can calculate the change in working capital.")
-    uploaded = st.file_uploader("Upload financial statements (.xlsx or .csv)", type=["xlsx", "csv"])
+    st.markdown("Upload a structured Excel workbook or CSV. The app will suggest column matches, then let you confirm them before calculating FCFF.")
+    with st.expander("What information is needed?", expanded=False):
+        st.markdown("The model needs one row per financial year and eight inputs: Year, EBIT, Tax rate, D&A, CapEx, Receivables, Inventory, and Payables.")
+        st.caption("Amounts should use one consistent unit and currency. Tax rate should be entered as 22 for 22%, not 0.22. For now, this guided importer reads structured tables; it does not automatically extract arbitrary PDF annual reports.")
+    uploaded = st.file_uploader("Upload financial statements (.xlsx or .csv)", type=["xlsx", "csv"], key="financial_upload")
     if uploaded is not None:
         try:
-            raw = read_financial_file(uploaded)
-            history = calculate_fcff(raw)
-            valid = history.dropna(subset=["FCFF"])
-            if valid.empty:
-                st.error("No valid FCFF could be calculated from this file.")
+            if uploaded.name.lower().endswith(".xlsx"):
+                uploaded.seek(0)
+                workbook = pd.ExcelFile(uploaded)
+                sheet = st.selectbox("Which sheet contains the historical financial data?", workbook.sheet_names, key="financial_sheet")
+                raw_upload = read_uploaded_table(uploaded, sheet)
             else:
-                latest = valid.iloc[-1]
-                starting_fcff = float(latest["FCFF"])
-                source_label = f"Uploaded statements — FY {int(latest['Year'])}"
-                st.success(f"Calculated latest FCFF: EGP {starting_fcff:,.2f} million (FY {int(latest['Year'])}).")
-                st.dataframe(history.round(2), use_container_width=True, hide_index=True)
+                raw_upload = read_uploaded_table(uploaded)
+            if raw_upload.empty or len(raw_upload.columns) == 0:
+                st.error("The selected file or sheet appears to be empty.")
+            else:
+                raw_upload.columns = [str(c).strip() for c in raw_upload.columns]
+                st.markdown("#### Step A — Preview your uploaded data")
+                st.caption("Check that the correct table and header row were detected. If the preview starts with a title or blank rows, clean the sheet so the column names are in the first row of the table.")
+                st.dataframe(raw_upload.head(12), use_container_width=True, hide_index=True)
+                suggestions = suggest_column_mapping(raw_upload.columns)
+                st.markdown("#### Step B — Confirm the column matches")
+                st.caption("We suggest matches automatically. Please check them: similar names do not always mean the same financial concept.")
+                options = ["— Select a column —"] + list(raw_upload.columns)
+                mapped = {}
+                left, right = st.columns(2)
+                for i, target in enumerate(REQUIRED_COLUMNS):
+                    container = left if i % 2 == 0 else right
+                    with container:
+                        suggested = suggestions.get(target, "— Select a column —")
+                        index = options.index(suggested) if suggested in options else 0
+                        mapped[target] = st.selectbox(
+                            f"{target} " + ("(year)" if target == "Year" else "(percentage, 0–100)" if target == "Tax_Rate" else "(same currency/unit throughout)"),
+                            options, index=index, key=f"map_{target}"
+                        )
+                unresolved = [target for target, col in mapped.items() if col == "— Select a column —"]
+                duplicate_sources = [col for col in mapped.values() if col != "— Select a column —" and list(mapped.values()).count(col) > 1]
+                if unresolved:
+                    st.warning("Please choose a source column for: " + ", ".join(unresolved) + ".")
+                if duplicate_sources:
+                    st.warning("One source column is mapped to more than one field: " + ", ".join(sorted(set(duplicate_sources))) + ". Check that each mapping is correct.")
+                if not unresolved:
+                    candidate = pd.DataFrame({target: raw_upload[source_col] for target, source_col in mapped.items()})
+                    st.markdown("#### Step C — Review the mapped inputs")
+                    st.caption("You can edit incorrect or missing values in this review table before the model calculates FCFF.")
+                    edited = st.data_editor(candidate, use_container_width=True, hide_index=True, num_rows="fixed", key="mapped_financial_review")
+                    if st.button("Confirm data and calculate historical FCFF", type="primary", key="confirm_financial_data"):
+                        try:
+                            clean = validate_mapped_data(edited)
+                            history = calculate_fcff(clean)
+                            valid = history.dropna(subset=["FCFF"])
+                            if valid.empty:
+                                st.error("No valid FCFF could be calculated from the selected data.")
+                                history = None
+                            else:
+                                latest = valid.iloc[-1]
+                                starting_fcff = float(latest["FCFF"])
+                                source_label = f"Uploaded statements — FY {int(latest['Year'])}"
+                                st.session_state["confirmed_financial_history"] = history
+                                st.session_state["confirmed_starting_fcff"] = starting_fcff
+                                st.session_state["confirmed_source_label"] = source_label
+                                st.success(f"Data confirmed. Latest calculated FCFF: {starting_fcff:,.2f} (FY {int(latest['Year'])}).")
+                        except Exception as e:
+                            st.error(f"Please review the mapped data: {e}")
+                saved_history = st.session_state.get("confirmed_financial_history")
+                if saved_history is not None:
+                    history = saved_history
+                    starting_fcff = float(st.session_state["confirmed_starting_fcff"])
+                    source_label = st.session_state["confirmed_source_label"]
+                    st.success(f"Using confirmed historical data. Latest FCFF: {starting_fcff:,.2f} — {source_label}.")
+                    st.dataframe(history.round(2), use_container_width=True, hide_index=True)
         except Exception as e:
-            st.error(f"Could not read this file: {e}")
-            history = None
+            st.error(f"We couldn't read this file or sheet: {e}")
+            history = st.session_state.get("confirmed_financial_history")
 
 if source == "Calculate FCFF from financial statements" and history is None:
     st.info("Upload a valid file first. The model will use the calculated latest FCFF after the upload is successful.")
