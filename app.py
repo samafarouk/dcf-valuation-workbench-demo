@@ -105,6 +105,29 @@ def read_uploaded_table(uploaded_file, sheet_name=None):
     return pd.read_excel(uploaded_file, sheet_name=sheet_name)
 
 
+def convert_table_orientation(raw_data: pd.DataFrame, orientation: str) -> pd.DataFrame:
+    """Convert a metric-by-year table into one row per year when requested."""
+    data = raw_data.copy()
+    data.columns = [str(c).strip() for c in data.columns]
+    if orientation == "Each row is a year (standard)":
+        return data
+
+    if data.shape[1] < 2:
+        raise ValueError("The horizontal layout needs a label column and at least one data column.")
+
+    # In this layout, the first column contains metric labels (EBIT, D&A, etc.)
+    # and the remaining columns contain years or periods.
+    label_col = data.columns[0]
+    data = data.dropna(subset=[label_col]).copy()
+    data[label_col] = data[label_col].astype(str).str.strip()
+    data = data[data[label_col] != ""]
+    data = data.drop_duplicates(subset=[label_col], keep="first")
+    data = data.set_index(label_col).T
+    data.index.name = "Year"
+    data = data.reset_index()
+    return data
+
+
 def validate_mapped_data(data):
     missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
     if missing:
@@ -206,6 +229,18 @@ if source == "Calculate FCFF from financial statements":
                 st.error("The selected file or sheet appears to be empty.")
             else:
                 raw_upload.columns = [str(c).strip() for c in raw_upload.columns]
+                orientation = st.radio(
+                    "How is your data arranged?",
+                    ["Each row is a year (standard)", "Metrics are rows and years are columns (horizontal)"],
+                    horizontal=False,
+                    help="Choose standard if each row is a year and each column is a metric. Choose horizontal if the first column contains labels such as EBIT or D&A and the columns to the right contain years."
+                )
+                if orientation == "Metrics are rows and years are columns (horizontal)":
+                    st.caption("We'll transpose this layout so each year becomes a row. The first column must contain metric names, and the remaining column headers should identify years.")
+                    try:
+                        raw_upload = convert_table_orientation(raw_upload, orientation)
+                    except Exception as orientation_error:
+                        st.error(f"We couldn't convert this layout: {orientation_error}")
                 st.markdown("#### Step A — Preview your uploaded data")
                 st.caption("Check that the correct table and header row were detected. If the preview starts with a title or blank rows, clean the sheet so the column names are in the first row of the table.")
                 st.dataframe(raw_upload.head(12), use_container_width=True, hide_index=True)
