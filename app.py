@@ -105,29 +105,6 @@ def read_uploaded_table(uploaded_file, sheet_name=None):
     return pd.read_excel(uploaded_file, sheet_name=sheet_name)
 
 
-def convert_table_orientation(raw_data: pd.DataFrame, orientation: str) -> pd.DataFrame:
-    """Convert a metric-by-year table into one row per year when requested."""
-    data = raw_data.copy()
-    data.columns = [str(c).strip() for c in data.columns]
-    if orientation == "Each row is a year (standard)":
-        return data
-
-    if data.shape[1] < 2:
-        raise ValueError("The horizontal layout needs a label column and at least one data column.")
-
-    # In this layout, the first column contains metric labels (EBIT, D&A, etc.)
-    # and the remaining columns contain years or periods.
-    label_col = data.columns[0]
-    data = data.dropna(subset=[label_col]).copy()
-    data[label_col] = data[label_col].astype(str).str.strip()
-    data = data[data[label_col] != ""]
-    data = data.drop_duplicates(subset=[label_col], keep="first")
-    data = data.set_index(label_col).T
-    data.index.name = "Year"
-    data = data.reset_index()
-    return data
-
-
 def validate_mapped_data(data):
     missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
     if missing:
@@ -211,102 +188,191 @@ starting_fcff = manual_fcff
 source_label = "Manual input"
 
 if source == "Calculate FCFF from financial statements":
-    st.markdown("Upload a structured Excel workbook or CSV. The app will suggest column matches, then let you confirm them before calculating FCFF.")
-    with st.expander("What information is needed?", expanded=False):
-        st.markdown("The model needs one row per financial year and eight inputs: Year, EBIT, Tax rate, D&A, CapEx, Receivables, Inventory, and Payables.")
-        st.caption("Amounts should use one consistent unit and currency. Tax rate should be entered as 22 for 22%, not 0.22. For now, this guided importer reads structured tables; it does not automatically extract arbitrary PDF annual reports.")
-    uploaded = st.file_uploader("Upload financial statements (.xlsx or .csv)", type=["xlsx", "csv"], key="financial_upload")
+    st.markdown("Upload an Excel workbook or CSV. You can select a specific table inside a worksheet, so separate WACC, assumptions, and valuation blocks won't be treated as one giant table.")
+    with st.expander("What can I import?", expanded=False):
+        st.markdown("**Historical statements:** map Year, EBIT, Tax Rate, D&A, CapEx, Receivables, Inventory, and Payables to calculate FCFF.\n\n**An existing DCF model:** if your workbook already has a row called Free Cash Flow to Firm (FCFF) or Free Cash Flow (FCF), you can select that row and use its latest forecast value as starting FCFF. This is a shortcut, so confirm that the chosen row represents FCFF and that its units are consistent.")
+        st.caption("The importer reads structured Excel/CSV data. It does not automatically extract arbitrary PDF reports.")
+
+    uploaded = st.file_uploader("Upload financial statements or an existing valuation workbook (.xlsx or .csv)", type=["xlsx", "csv"], key="financial_upload")
     if uploaded is not None:
         try:
             if uploaded.name.lower().endswith(".xlsx"):
                 uploaded.seek(0)
                 workbook = pd.ExcelFile(uploaded)
-                sheet = st.selectbox("Which sheet contains the historical financial data?", workbook.sheet_names, key="financial_sheet")
-                raw_upload = read_uploaded_table(uploaded, sheet)
+                sheet = st.selectbox("1. Choose the worksheet", workbook.sheet_names, key="financial_sheet")
+                uploaded.seek(0)
+                raw_grid = pd.read_excel(uploaded, sheet_name=sheet, header=None)
             else:
-                raw_upload = read_uploaded_table(uploaded)
-            if raw_upload.empty or len(raw_upload.columns) == 0:
-                st.error("The selected file or sheet appears to be empty.")
+                uploaded.seek(0)
+                raw_grid = pd.read_csv(uploaded, header=None)
+                sheet = "CSV"
+
+            # Remove completely empty edges while preserving positions within the used range.
+            raw_grid = raw_grid.dropna(axis=0, how="all").dropna(axis=1, how="all")
+            raw_grid = raw_grid.reset_index(drop=True)
+            raw_grid.columns = range(raw_grid.shape[1])
+            if raw_grid.empty or raw_grid.shape[1] == 0:
+                st.error("The selected worksheet appears to be empty.")
             else:
-                raw_upload.columns = [str(c).strip() for c in raw_upload.columns]
-                orientation = st.radio(
-                    "How is your data arranged?",
-                    ["Each row is a year (standard)", "Metrics are rows and years are columns (horizontal)"],
-                    horizontal=False,
-                    help="Choose standard if each row is a year and each column is a metric. Choose horizontal if the first column contains labels such as EBIT or D&A and the columns to the right contain years."
+                st.markdown("#### Step A — Preview the worksheet")
+                st.caption("This is the raw worksheet, before the app tries to interpret it. You can see the separate blocks in your workbook and select just the table you need.")
+                st.dataframe(raw_grid.head(30), use_container_width=True, hide_index=True)
+                st.markdown("#### Step B — Select the table you want to use")
+                import_mode = st.radio(
+                    "What kind of data are you importing?",
+                    ["Historical statements (calculate FCFF)", "Existing DCF model (use an existing FCFF/FCF row)"],
+                    key="import_mode",
+                    help="Choose historical statements when you have operating data and working-capital inputs. Choose existing DCF only when a valid FCFF/FCF row is already calculated in the workbook."
                 )
-                if orientation == "Metrics are rows and years are columns (horizontal)":
-                    st.caption("We'll transpose this layout so each year becomes a row. The first column must contain metric names, and the remaining column headers should identify years.")
-                    try:
-                        raw_upload = convert_table_orientation(raw_upload, orientation)
-                    except Exception as orientation_error:
-                        st.error(f"We couldn't convert this layout: {orientation_error}")
-                st.markdown("#### Step A — Preview your uploaded data")
-                st.caption("Check that the correct table and header row were detected. If the preview starts with a title or blank rows, clean the sheet so the column names are in the first row of the table.")
-                st.dataframe(raw_upload.head(12), use_container_width=True, hide_index=True)
-                suggestions = suggest_column_mapping(raw_upload.columns)
-                st.markdown("#### Step B — Confirm the column matches")
-                st.caption("We suggest matches automatically. Please check them: similar names do not always mean the same financial concept.")
-                options = ["— Select a column —"] + list(raw_upload.columns)
-                mapped = {}
-                left, right = st.columns(2)
-                for i, target in enumerate(REQUIRED_COLUMNS):
-                    container = left if i % 2 == 0 else right
-                    with container:
-                        suggested = suggestions.get(target, "— Select a column —")
-                        index = options.index(suggested) if suggested in options else 0
-                        mapped[target] = st.selectbox(
-                            f"{target} " + ("(year)" if target == "Year" else "(percentage, 0–100)" if target == "Tax_Rate" else "(same currency/unit throughout)"),
-                            options, index=index, key=f"map_{target}"
-                        )
-                unresolved = [target for target, col in mapped.items() if col == "— Select a column —"]
-                duplicate_sources = [col for col in mapped.values() if col != "— Select a column —" and list(mapped.values()).count(col) > 1]
-                if unresolved:
-                    st.warning("Please choose a source column for: " + ", ".join(unresolved) + ".")
-                if duplicate_sources:
-                    st.warning("One source column is mapped to more than one field: " + ", ".join(sorted(set(duplicate_sources))) + ". Check that each mapping is correct.")
-                if not unresolved:
-                    candidate = pd.DataFrame({target: raw_upload[source_col] for target, source_col in mapped.items()})
-                    st.markdown("#### Step C — Review the mapped inputs")
-                    st.caption("You can edit incorrect or missing values in this review table before the model calculates FCFF.")
-                    edited = st.data_editor(candidate, use_container_width=True, hide_index=True, num_rows="fixed", key="mapped_financial_review")
-                    if st.button("Confirm data and calculate historical FCFF", type="primary", key="confirm_financial_data"):
-                        try:
-                            clean = validate_mapped_data(edited)
-                            history = calculate_fcff(clean)
-                            valid = history.dropna(subset=["FCFF"])
-                            if valid.empty:
-                                st.error("No valid FCFF could be calculated from the selected data.")
-                                history = None
+                max_row = max(0, len(raw_grid) - 1)
+                max_col = max(0, len(raw_grid.columns) - 1)
+                r1, r2 = st.columns(2)
+                with r1:
+                    row_start = st.number_input("First worksheet row", min_value=1, max_value=max(1, len(raw_grid)), value=1, step=1, key="table_row_start")
+                with r2:
+                    row_end = st.number_input("Last worksheet row", min_value=1, max_value=max(1, len(raw_grid)), value=min(len(raw_grid), 15), step=1, key="table_row_end")
+                c1, c2 = st.columns(2)
+                with c1:
+                    col_start = st.number_input("First worksheet column (A=1, B=2...)", min_value=1, max_value=max(1, len(raw_grid.columns)), value=1, step=1, key="table_col_start")
+                with c2:
+                    col_end = st.number_input("Last worksheet column", min_value=1, max_value=max(1, len(raw_grid.columns)), value=len(raw_grid.columns), step=1, key="table_col_end")
+
+                if row_end < row_start or col_end < col_start:
+                    st.warning("The ending row/column must be equal to or greater than the starting row/column.")
+                else:
+                    table = raw_grid.iloc[int(row_start)-1:int(row_end), int(col_start)-1:int(col_end)].copy()
+                    table = table.dropna(axis=0, how="all").dropna(axis=1, how="all")
+                    st.markdown("##### Selected table preview")
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+
+                    if import_mode == "Historical statements (calculate FCFF)":
+                        orientation = st.radio("How is this table arranged?", ["Each row is a year (standard)", "Metrics are rows and years are columns (horizontal)"], horizontal=False, key="selected_table_orientation")
+                        if orientation == "Each row is a year (standard)":
+                            header_row = st.number_input("Header row within selected table", min_value=1, max_value=max(1, len(table)), value=1, step=1, key="selected_header_row")
+                            hdr = table.iloc[int(header_row)-1].fillna("").astype(str).str.strip().tolist()
+                            data = table.iloc[int(header_row):].copy()
+                            data.columns = [v if v else f"Unnamed: {i}" for i, v in enumerate(hdr)]
+                            data = data.dropna(how="all").reset_index(drop=True)
+                        else:
+                            st.caption("For this layout, the first column should contain metric labels (EBIT, D&A, etc.) and the first row should contain years.")
+                            label_col = st.selectbox("Column containing metric names", list(table.columns), format_func=lambda x: f"Selected-table column {int(x)+1}", key="metric_label_col")
+                            header_row = st.number_input("Row containing years within selected table", min_value=1, max_value=max(1, len(table)), value=1, step=1, key="horizontal_year_header")
+                            header_values = table.iloc[int(header_row)-1].tolist()
+                            label_values = table.iloc[:, int(label_col)].astype(str).str.strip()
+                            rows = []
+                            for idx, label in label_values.items():
+                                if idx == int(header_row)-1 or not label or label.lower() == "nan":
+                                    continue
+                                row = {"Metric": label}
+                                for j, year_value in enumerate(header_values):
+                                    if j == int(label_col):
+                                        continue
+                                    row[str(year_value).strip()] = table.iloc[idx, j]
+                                rows.append(row)
+                            transposed = pd.DataFrame(rows)
+                            if not transposed.empty:
+                                transposed = transposed.set_index("Metric").T.reset_index().rename(columns={"index": "Year"})
+                                transposed.columns = [str(c).strip() for c in transposed.columns]
+                                data = transposed
                             else:
-                                latest = valid.iloc[-1]
-                                starting_fcff = float(latest["FCFF"])
-                                source_label = f"Uploaded statements — FY {int(latest['Year'])}"
-                                st.session_state["confirmed_financial_history"] = history
-                                st.session_state["confirmed_starting_fcff"] = starting_fcff
-                                st.session_state["confirmed_source_label"] = source_label
-                                st.success(f"Data confirmed. Latest calculated FCFF: {starting_fcff:,.2f} (FY {int(latest['Year'])}).")
-                        except Exception as e:
-                            st.error(f"Please review the mapped data: {e}")
+                                data = pd.DataFrame()
+                        if not data.empty:
+                            data.columns = [str(c).strip() for c in data.columns]
+                            st.markdown("#### Step C — Confirm the column matches")
+                            st.caption("Choose which column contains each financial metric. You can correct every suggestion.")
+                            suggestions = suggest_column_mapping(data.columns)
+                            options = ["— Select a column —"] + list(data.columns)
+                            mapped = {}
+                            left, right = st.columns(2)
+                            for i, target in enumerate(REQUIRED_COLUMNS):
+                                container = left if i % 2 == 0 else right
+                                with container:
+                                    suggested = suggestions.get(target, "— Select a column —")
+                                    index = options.index(suggested) if suggested in options else 0
+                                    mapped[target] = st.selectbox(f"{target}" + (" (year)" if target == "Year" else " (percentage, 0–100)" if target == "Tax_Rate" else ""), options, index=index, key=f"map_{target}")
+                            unresolved = [target for target, col in mapped.items() if col == "— Select a column —"]
+                            if unresolved:
+                                st.warning("Please select a source column for: " + ", ".join(unresolved) + ".")
+                            else:
+                                candidate = pd.DataFrame({target: data[source_col] for target, source_col in mapped.items()})
+                                st.markdown("#### Step D — Review and edit the mapped inputs")
+                                edited = st.data_editor(candidate, use_container_width=True, hide_index=True, num_rows="fixed", key="mapped_financial_review")
+                                if st.button("Confirm data and calculate historical FCFF", type="primary", key="confirm_financial_data"):
+                                    try:
+                                        clean = validate_mapped_data(edited)
+                                        history = calculate_fcff(clean)
+                                        valid = history.dropna(subset=["FCFF"])
+                                        if valid.empty:
+                                            st.error("No valid FCFF could be calculated from the selected data.")
+                                        else:
+                                            latest = valid.iloc[-1]
+                                            starting_fcff = float(latest["FCFF"])
+                                            source_label = f"Uploaded statements — FY {int(latest['Year'])}"
+                                            st.session_state["confirmed_financial_history"] = history
+                                            st.session_state["confirmed_starting_fcff"] = starting_fcff
+                                            st.session_state["confirmed_source_label"] = source_label
+                                            st.success(f"Data confirmed. Latest calculated FCFF: {starting_fcff:,.2f} (FY {int(latest['Year'])}).")
+                                    except Exception as e:
+                                        st.error(f"Please review the mapped data: {e}")
+                        else:
+                            st.warning("The selected range is empty. Adjust the row and column boundaries to select the table you need.")
+                    else:
+                        st.caption("Use this when your workbook already contains a calculated FCFF/FCF row. Select a range that includes the metric labels and the year/value columns.")
+                        label_col = st.selectbox("Column containing metric labels", list(table.columns), format_func=lambda x: f"Selected-table column {int(x)+1}", key="existing_fcf_label_col")
+                        metric_names = table.iloc[:, int(label_col)].fillna("").astype(str).str.strip().tolist()
+                        metric_options = [m for m in metric_names if m and m.lower() != "nan"]
+                        if metric_options:
+                            selected_metric = st.selectbox("Choose the row that represents FCFF / FCF", metric_options, key="existing_fcf_metric")
+                            matching_positions = [i for i, value in enumerate(metric_names) if value == selected_metric]
+                            metric_row = table.iloc[matching_positions[0]]
+                            value_columns = [i for i in table.columns if i != label_col]
+                            year_values = []
+                            fcff_values = []
+                            for col in value_columns:
+                                val = pd.to_numeric(pd.Series([metric_row[col]]), errors="coerce").iloc[0]
+                                if pd.notna(val):
+                                    year_values.append(str(table.iloc[0, col]).strip())
+                                    fcff_values.append(float(val))
+                            if fcff_values:
+                                preview_fcff = pd.DataFrame({"Period": year_values, "FCFF / FCF value": fcff_values})
+                                st.dataframe(preview_fcff, use_container_width=True, hide_index=True)
+                                st.warning("Confirm that this row is unlevered free cash flow to the firm (FCFF), not equity free cash flow (FCFE), EBITDA, or a valuation output. The app cannot infer financial meaning from the label alone.")
+                                if st.button("Use the last numeric value as starting FCFF", type="primary", key="confirm_existing_fcf"):
+                                    starting_fcff = fcff_values[-1]
+                                    source_label = f"Existing model row — {selected_metric} ({year_values[-1]})"
+                                    history = None
+                                    st.session_state["confirmed_starting_fcff"] = starting_fcff
+                                    st.session_state["confirmed_source_label"] = source_label
+                                    st.session_state["confirmed_financial_history"] = None
+                                    st.success(f"Starting FCFF set to {starting_fcff:,.2f} from {selected_metric} ({year_values[-1]}).")
+                            else:
+                                st.info("No numeric values were found in this row within the selected table. Expand or adjust your selected range.")
+                        else:
+                            st.info("No metric labels found in the selected first column. Adjust the selected range or choose another label column.")
+
                 saved_history = st.session_state.get("confirmed_financial_history")
-                if saved_history is not None:
-                    history = saved_history
-                    starting_fcff = float(st.session_state["confirmed_starting_fcff"])
+                saved_fcff = st.session_state.get("confirmed_starting_fcff")
+                if saved_fcff is not None and st.session_state.get("confirmed_source_label"):
+                    starting_fcff = float(saved_fcff)
                     source_label = st.session_state["confirmed_source_label"]
-                    st.success(f"Using confirmed historical data. Latest FCFF: {starting_fcff:,.2f} — {source_label}.")
-                    st.dataframe(history.round(2), use_container_width=True, hide_index=True)
+                    if saved_history is not None:
+                        history = saved_history
+                        st.success(f"Using confirmed historical data. Latest FCFF: {starting_fcff:,.2f} — {source_label}.")
+                        st.dataframe(history.round(2), use_container_width=True, hide_index=True)
+                    elif str(source_label).startswith("Existing model row"):
+                        st.success(f"Using confirmed existing FCFF value: {starting_fcff:,.2f} — {source_label}.")
         except Exception as e:
             st.error(f"We couldn't read this file or sheet: {e}")
             history = st.session_state.get("confirmed_financial_history")
 
-if source == "Calculate FCFF from financial statements" and history is None:
-    st.info("Upload a valid file first. The model will use the calculated latest FCFF after the upload is successful.")
+if source == "Calculate FCFF from financial statements" and history is None and not str(source_label).startswith("Existing model row"):
+    st.info("Upload a valid file and confirm either historical statements or an existing FCFF/FCF row before calculating.")
 
 if calculate:
     if not company.strip():
         st.error("Please enter a company name.")
-    elif source == "Calculate FCFF from financial statements" and history is None:
-        st.error("Please upload a valid financial-statement file before calculating.")
+    elif source == "Calculate FCFF from financial statements" and history is None and not str(source_label).startswith("Existing model row"):
+        st.error("Please upload a valid financial-statement file or confirm an existing FCFF/FCF row before calculating.")
     else:
         try:
             g, r, tg = growth_pct / 100, wacc_pct / 100, terminal_pct / 100
