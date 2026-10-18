@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import date
 
 import pandas as pd
@@ -345,16 +346,32 @@ if source == "Calculate FCFF from financial statements":
                             value_columns = [i for i in table.columns if i != label_col]
                             year_values = []
                             fcff_values = []
+                            # Complex worksheets may contain extra numeric cells after the forecast
+                            # years. Only accept values under a meaningful year/period heading.
+                            def clean_period(value):
+                                if pd.isna(value):
+                                    return None
+                                text = str(value).strip()
+                                if not text or text.lower() in {"nan", "none", "nat"}:
+                                    return None
+                                if re.search(r"(19|20)\\d{2}", text):
+                                    return text
+                                if re.fullmatch(r"year\\s*\\d+", text.lower()):
+                                    return text
+                                return None
+
+                            period_header_row = table.iloc[0]
                             for col in value_columns:
+                                period = clean_period(period_header_row[col])
                                 val = pd.to_numeric(pd.Series([metric_row[col]]), errors="coerce").iloc[0]
-                                if pd.notna(val):
-                                    year_values.append(str(table.iloc[0, col]).strip())
+                                if period is not None and pd.notna(val):
+                                    year_values.append(period)
                                     fcff_values.append(float(val))
                             if fcff_values:
                                 preview_fcff = pd.DataFrame({"Period": year_values, "FCFF / FCF value": fcff_values})
                                 st.dataframe(preview_fcff, use_container_width=True, hide_index=True)
                                 st.warning("Confirm that this row is unlevered free cash flow to the firm (FCFF), not equity free cash flow (FCFE), EBITDA, or a valuation output. The app cannot infer financial meaning from the label alone.")
-                                if st.button("Use the last numeric value as starting FCFF", type="primary", key="confirm_existing_fcf"):
+                                if st.button("Confirm selected cash flow as starting FCFF", type="primary", key="confirm_existing_fcf"):
                                     starting_fcff = fcff_values[-1]
                                     source_label = f"Existing model row — {selected_metric} ({year_values[-1]})"
                                     history = None
@@ -362,6 +379,7 @@ if source == "Calculate FCFF from financial statements":
                                     st.session_state["confirmed_source_label"] = source_label
                                     st.session_state["confirmed_financial_history"] = None
                                     st.success(f"Starting FCFF set to {starting_fcff:,.2f} from {selected_metric} ({year_values[-1]}).")
+                                    st.info("Next: click **Calculate valuation** in the left sidebar to generate the valuation dashboard, scenarios, sensitivity analysis, and exports.")
                             else:
                                 st.info("No numeric values were found in this row within the selected table. Expand or adjust your selected range.")
                         else:
