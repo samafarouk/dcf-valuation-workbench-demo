@@ -215,7 +215,7 @@ if source == "Calculate FCFF from financial statements":
                 st.error("The selected worksheet appears to be empty.")
             else:
                 st.markdown("#### Step A — Preview the worksheet")
-                st.caption("This is the raw worksheet, before the app tries to interpret it. You can see the separate blocks in your workbook and select just the table you need.")
+                st.caption("This is the raw worksheet, before interpretation. If the sheet contains side-by-side blocks, select only one block at a time using the row and column boundaries below.")
                 st.dataframe(raw_grid.head(30), use_container_width=True, hide_index=True)
                 st.markdown("#### Step B — Select the table you want to use")
                 import_mode = st.radio(
@@ -258,24 +258,41 @@ if source == "Calculate FCFF from financial statements":
                             label_col = st.selectbox("Column containing metric names", list(table.columns), format_func=lambda x: f"Selected-table column {int(x)+1}", key="metric_label_col")
                             header_row = st.number_input("Row containing years within selected table", min_value=1, max_value=max(1, len(table)), value=1, step=1, key="horizontal_year_header")
                             header_values = table.iloc[int(header_row)-1].tolist()
-                            label_values = table.iloc[:, int(label_col)].astype(str).str.strip()
+                            label_values = table.iloc[:, int(label_col)].tolist()
+                            # Keep only columns whose header looks like a year/period. This avoids
+                            # treating blank cells or side-by-side assumptions blocks as data columns.
+                            def period_label(value):
+                                text = str(value).strip()
+                                match = __import__("re").search(r"(19|20)\d{2}", text)
+                                return match.group(0) if match else None
+                            period_cols = []
+                            for j, value in enumerate(header_values):
+                                if j == int(label_col):
+                                    continue
+                                period = period_label(value)
+                                if period:
+                                    period_cols.append((j, period))
                             rows = []
-                            for idx, label in label_values.items():
+                            for idx, label_value in enumerate(label_values):
+                                label = str(label_value).strip()
                                 if idx == int(header_row)-1 or not label or label.lower() == "nan":
                                     continue
-                                row = {"Metric": label}
-                                for j, year_value in enumerate(header_values):
-                                    if j == int(label_col):
-                                        continue
-                                    row[str(year_value).strip()] = table.iloc[idx, j]
-                                rows.append(row)
+                                # Ignore rows that have no numeric values under the detected year columns.
+                                metric_values = {}
+                                for j, period in period_cols:
+                                    cell_value = table.iloc[idx, j]
+                                    metric_values[period] = cell_value
+                                if any(pd.notna(v) for v in metric_values.values()):
+                                    rows.append({"Metric": label, **metric_values})
                             transposed = pd.DataFrame(rows)
-                            if not transposed.empty:
-                                transposed = transposed.set_index("Metric").T.reset_index().rename(columns={"index": "Year"})
+                            if not transposed.empty and period_cols:
+                                transposed = transposed.drop_duplicates(subset=["Metric"], keep="first").set_index("Metric").T.reset_index().rename(columns={"index": "Year"})
                                 transposed.columns = [str(c).strip() for c in transposed.columns]
                                 data = transposed
+                                st.success(f"Detected {len(period_cols)} year column(s): {', '.join(dict.fromkeys(p for _, p in period_cols))}.")
                             else:
                                 data = pd.DataFrame()
+                                st.warning("We couldn't identify year columns in the selected header row. Choose the row that contains headings such as 2026, 2027, 2028.")
                         if not data.empty:
                             data.columns = [str(c).strip() for c in data.columns]
                             st.markdown("#### Step C — Confirm the column matches")
@@ -320,7 +337,7 @@ if source == "Calculate FCFF from financial statements":
                         st.caption("Use this when your workbook already contains a calculated FCFF/FCF row. Select a range that includes the metric labels and the year/value columns.")
                         label_col = st.selectbox("Column containing metric labels", list(table.columns), format_func=lambda x: f"Selected-table column {int(x)+1}", key="existing_fcf_label_col")
                         metric_names = table.iloc[:, int(label_col)].fillna("").astype(str).str.strip().tolist()
-                        metric_options = [m for m in metric_names if m and m.lower() != "nan"]
+                        metric_options = [str(m) for m in metric_names if str(m).strip() and str(m).strip().lower() != "nan"]
                         if metric_options:
                             selected_metric = st.selectbox("Choose the row that represents FCFF / FCF", metric_options, key="existing_fcf_metric")
                             matching_positions = [i for i, value in enumerate(metric_names) if value == selected_metric]
