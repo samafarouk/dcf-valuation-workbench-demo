@@ -1,7 +1,7 @@
 # DCF Valuation Calculator Demo
 A hands-on, interactive workspace for exploring Discounted Cash Flow valuation.
 
-![DCF Calculator Interface](https://raw.githubusercontent.com/samafarouk/Mini-Quant-Lab-Project-Series/main/Assets/DCF_Interface.png)
+![DCF Calculator Interface](https://raw.githubusercontent.com/samafarouk/dcf-valuation-workbench-demo/main/DCF_Interface.png)
   
 <p>
   <img src="https://img.shields.io/badge/Status-Under%20Improvement-orange?style=for-the-badge" alt="Under Improvement">
